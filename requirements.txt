@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets
+groq
+python-dotenv
+numpy
+pydantic
+scipy
