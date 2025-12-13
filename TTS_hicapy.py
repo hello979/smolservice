@@ -10,11 +10,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from groq import Groq
 from dotenv import load_dotenv
-import httpx  # <--- NEW: Using direct HTTP client (Included with Groq/Deepgram installs)
-
-# Remove the DeepgramClient import if you aren't using it elsewhere, 
-# or keep it if you use it for transcription.
-# from deepgram import DeepgramClient 
+import httpx 
 
 load_dotenv()
 
@@ -40,8 +36,6 @@ try:
 except Exception as e:
     logger.error(f"Failed to initialize Groq Client: {e}")
     raise
-
-# (We do not need to initialize DeepgramClient for the Direct API method)
 
 # --- Data Models ---
 class GenerateTextRequest(BaseModel):
@@ -79,7 +73,6 @@ class AudioProcessor:
                 n_frames = source_wav.getnframes()
                 raw_data = source_wav.readframes(n_frames)
 
-            # Assuming 16-bit input from Deepgram (Linear16)
             if width == 2:
                 dtype = np.int16
             elif width == 1:
@@ -89,12 +82,10 @@ class AudioProcessor:
             
             audio_data = np.frombuffer(raw_data, dtype=dtype)
 
-            # Mono Conversion
             if channels == 2:
                 audio_data = audio_data.reshape(-1, 2)
                 audio_data = audio_data.mean(axis=1).astype(np.int16)
             
-            # Resampling
             if original_rate != target_rate:
                 num_samples = int(len(audio_data) * target_rate / original_rate)
                 audio_data = signal.resample(audio_data, num_samples).astype(np.int16)
@@ -164,7 +155,7 @@ async def generate_text(request: GenerateTextRequest):
 @app.post("/generate-audio")
 async def generate_audio(request: GenerateAudioRequest):
     """
-    Generates WAV audio using Direct Deepgram API calls (Bypassing SDK).
+    Generates WAV audio (binary) and returns readable text in X-Transcript header.
     """
     try:
         # Step A: Get Text
@@ -193,8 +184,7 @@ async def generate_audio(request: GenerateAudioRequest):
 
         logger.info(f"Generating audio for: '{text_to_speak[:30]}...'")
 
-        # Step B: Direct API Call (The Bulletproof Fix)
-        # We construct the URL manually. This cannot fail due to SDK version issues.
+        # Step B: Direct API Call
         deepgram_url = f"https://api.deepgram.com/v1/speak?model={TTS_MODEL_ID}&encoding=linear16&container=wav&sample_rate={SAMPLE_RATE_REQUIRED}"
         
         headers = {
@@ -204,7 +194,6 @@ async def generate_audio(request: GenerateAudioRequest):
         
         payload = {"text": text_to_speak}
 
-        # Use httpx for async HTTP request (It is installed with Groq/FastAPI usually)
         async with httpx.AsyncClient() as http_client:
             api_response = await http_client.post(deepgram_url, headers=headers, json=payload)
             
@@ -215,8 +204,21 @@ async def generate_audio(request: GenerateAudioRequest):
             
             raw_wav_content = api_response.content
 
-        # Step D: Process Audio
+        # Step C: Process Audio
         processed_wav = AudioProcessor.process_wav_bytes(raw_wav_content, SAMPLE_RATE_REQUIRED)
+
+        # Step D: Sanitize Text for Headers
+        # Headers cannot contain newlines (\n or \r). We replace them with spaces.
+        # We do NOT use url-encoding, so spaces stay as spaces.
+        safe_transcript = text_to_speak.replace('\n', ' ').replace('\r', '')
+
+        # Ensure characters are latin-1 compatible (Standard HTTP limitation)
+        # If text contains emojis/complex unicode, we strip/replace them to prevent server errors.
+        try:
+            safe_transcript.encode('latin-1')
+        except UnicodeEncodeError:
+            # Fallback: simple ascii approximation if strict latin-1 fails
+            safe_transcript = safe_transcript.encode('ascii', 'ignore').decode('ascii')
 
         return Response(
             content=processed_wav,
@@ -224,7 +226,8 @@ async def generate_audio(request: GenerateAudioRequest):
             headers={
                 "Content-Length": str(len(processed_wav)),
                 "X-Bot-ID": request.bot_id,
-                "Content-Disposition": 'attachment; filename="output.wav"'
+                "Content-Disposition": 'attachment; filename="output.wav"',
+                "X-Transcript": safe_transcript  # <--- Plain readable text here
             }
         )
 
